@@ -1,0 +1,232 @@
+#! /usr/bin/env lua
+--
+-- presenter.lua
+-- Copyright (C) 2014 Adrian Perez <aperez@igalia.com>
+--
+-- Distributed under terms of the MIT license.
+--
+
+local lgi = require "lgi"
+local GLib, Gio, GObject, Gtk, Gdk, WebKit, Vte =
+  lgi.GLib, lgi.Gio, lgi.GObject, lgi.Gtk, lgi.Gdk, lgi.WebKit2, lgi.Vte
+local osc_cursor = "]12;#999999";
+
+
+local environment_overrides = {
+  -- Variables to always add to the environment
+  TERM = "xterm-256color";
+
+  -- Variables to always remove from the environment
+  VTE_VERSION = false;
+  TMUX_PANE = false;
+  TMUX = false;
+}
+
+
+local function make_new_environment()
+  local env = { }
+  for _, name in ipairs(GLib.listenv()) do
+    if environment_overrides[name] == nil then
+      env[name] = GLib.getenv(name)
+    end
+  end
+  for name, value in pairs(environment_overrides) do
+    if value ~= false then
+      env[name] = value
+    end
+  end
+end
+
+
+local function make_titlebar(stack, view)
+  local bar = Gtk.HeaderBar {
+    title = "Presenter";
+    subtitle = "(no presentation loaded)";
+    show_close_button = true;
+  }
+
+  bar:pack_end(Gtk.Button {
+    label = "Open";
+    on_clicked = function ()
+      local dialog = Gtk.FileChooserDialog {
+        title = "Open File…";
+        action = Gtk.FileChooserAction.OPEN;
+        local_only = true;
+        select_multiple = false;
+      }
+      dialog:add_button("_Cancel", Gtk.ResponseType.CANCEL)
+      dialog:add_button("_Open", Gtk.ResponseType.ACCEPT)
+      dialog:show_all()
+      if dialog:run() == Gtk.ResponseType.ACCEPT then
+        view:load_uri(dialog:get_uri())
+      end
+      dialog:destroy()
+    end;
+  })
+  bar:pack_start(Gtk.StackSwitcher {
+    stack = stack
+  })
+
+  view:bind_property("title", bar, "subtitle")
+
+  return bar
+end
+
+-- forward-declare
+local make_window
+
+local function make_web_view(related_view)
+  local view = WebKit.WebView {
+    related_view = related_view;
+    on_create = make_web_view;
+    can_focus = true;
+  }
+
+  if related_view then
+    local w, stack = make_window(view)
+    w:set_titlebar(make_titlebar(stack, view))
+    stack:bind_property("visible-child-name",
+      related_view:get_parent(), "visible-child-name",
+      GObject.Binding.BIDIRECTIONAL)
+    w:show_all()
+  else
+    local settings = view:get_settings()
+    settings:set_enable_java(false)
+    settings:set_enable_webgl(true)
+    settings:set_enable_plugins(false);
+    settings:set_enable_page_cache(false)
+    settings:set_enable_accelerated_2d_canvas(true)
+    settings:set_enable_write_console_messages_to_stdout(true)
+  end
+  return view
+end
+
+
+local function spawn_shell(vt)
+  vt:feed("[Starting terminal]\r\n\r\n")
+  vt:fork_command_full(
+    Vte.PtyFlags.DEFAULT,
+    nil,
+    { "zsh", "-" },
+    make_new_environment(),
+    GLib.SpawnFlags.SEARCH_PATH,
+    function () end)
+end
+
+
+local function make_terminal()
+  local vt = Vte.Terminal {
+    can_focus = true;
+    allow_bold = false;
+    visible_bell = true;
+    audible_bell = false;
+    rewrap_on_resize = true;
+    word_chars = "-A-Za-z0-9,./?%&#@_~";
+    scrollback_lines = 0;
+    cursor_shape = Vte.TerminalCursorShape.BLOCK;
+    cursor_blink_mode = Vte.TerminalCursorBlinkMode.ON;
+    on_child_exited = spawn_shell;
+  }
+  vt:set_encoding("utf-8")
+  vt:set_font_from_string("Meslo LG S for Powerline 20")
+  vt:feed(osc_cursor)
+  spawn_shell(vt)
+  return vt
+end
+
+
+function make_window(view)
+  local stack = Gtk.Stack { }
+  stack:add_titled(view, "web-view", "Slides")
+  stack:add_titled(make_terminal(), "terminal", "Terminal")
+  stack:set_visible_child_name("web-view")
+  stack.on_notify["visible-child"] = function (stack)
+    local child = stack:get_visible_child()
+    if child ~= nil then
+      child:grab_focus()
+    end
+  end
+
+  local accel_group = Gtk.AccelGroup { }
+
+  local w = Gtk.Window {
+    title = "Presenter";
+    type_ = Gtk.Window.TOPLEVEL;
+    hide_titlebar_when_maximized = true;
+    default_height = 600;
+    default_width = 800;
+    child = stack;
+    on_destroy = Gtk.main_quit;
+  }
+  w:add_accel_group(accel_group)
+  w:set_titlebar(make_titlebar(stack, view))
+  view.on_ready_to_show = function (view)
+    w:show_all()
+  end;
+
+  accel_group:connect(49, -- '1'
+    Gdk.ModifierType.CONTROL_MASK,
+    Gtk.AccelFlags.LOCKED,
+    GObject.Closure(function ()
+      stack:set_visible_child_name("web-view")
+    end))
+  accel_group:connect(50, -- '2'
+    Gdk.ModifierType.CONTROL_MASK,
+    Gtk.AccelFlags.LOCKED,
+    GObject.Closure(function ()
+      stack:set_visible_child_name("terminal")
+    end))
+  accel_group:connect(102, -- 'f'
+    Gdk.ModifierType.CONTROL_MASK,
+    Gtk.AccelFlags.LOCKED,
+    GObject.Closure(function () w:fullscreen() end))
+  accel_group:connect(117, -- 'u'
+    Gdk.ModifierType.CONTROL_MASK,
+    Gtk.AccelFlags.LOCKED,
+    GObject.Closure(function () w:unfullscreen() end))
+
+  return w, stack
+end
+
+local args = { ... }
+if #args > 1 then
+  error("Usage: presenter [file.html]")
+end
+
+Gtk.init(args)
+Gtk.Window.set_default_icon_name("libreoffice-impress")
+local view = make_web_view()
+view:load_html [[
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>(no presentation loaded)</title>
+    <style type="text/css">
+      body {
+        position: fixed;
+        height: 100%;
+        width: 100%;
+        margin: 0;
+        padding: 0;
+      }
+      p {
+        margin-top: 5m;
+        color: #ddd;
+        font-size: 50px;
+        font-weight: 200;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <p>No presentation</p>
+  </body>
+</html>
+]]
+if args[1] then
+  local uri = Gio.File.new_for_commandline_arg(args[1]):get_uri()
+  print("Loading: " .. uri)
+  view:load_uri(uri)
+end
+make_window(view):show_all()
+Gtk.main()
